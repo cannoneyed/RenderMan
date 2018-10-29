@@ -54,8 +54,6 @@ bool RenderEngine::loadPlugin (const std::string& path)
         plugin->prepareToPlay (sampleRate, bufferSize);
         plugin->setNonRealtime (true);
 
-        mfcc.setup (512, 42, 13, 20, int (sampleRate / 2), sampleRate);
-
         // Resize the pluginParameters patch type to fit this plugin and init
         // all the values to 0.0f!
         fillAvailablePluginParameters (pluginParameters);
@@ -70,77 +68,95 @@ bool RenderEngine::loadPlugin (const std::string& path)
     return false;
 }
 
+bool RenderEngine::loadMidi(const std::string& path)
+{
+    File file = File(path);
+    FileInputStream fileStream(file);
+    MidiFile midiFile;
+    midiFile.readFrom(fileStream);
+    midiFile.convertTimestampTicksToSeconds();
+    midiBuffer.clear();
+    
+    for (int t = 0; t < midiFile.getNumTracks(); t++) {
+        const MidiMessageSequence* track = midiFile.getTrack(t);
+        for (int i = 0; i < track->getNumEvents(); i++) {
+            MidiMessage& m = track->getEventPointer(i)->message;
+            int sampleOffset = (int)(sampleRate * m.getTimeStamp());
+            midiBuffer.addEvent(m, sampleOffset);
+        }
+    }
+    
+    return true;
+}
+
+void RenderEngine::renderMidi (const uint8 renderLength)
+{
+    // Data structure to hold multi-channel audio data.
+    AudioSampleBuffer audioBuffer (plugin->getTotalNumOutputChannels(),
+                                   bufferSize);
+    
+    int numberOfBuffers = int (std::ceil (renderLength * sampleRate / bufferSize));
+    
+    // Clear and reserve memory for the audio storage!
+    processedMonoAudioPreview.clear();
+    processedMonoAudioPreview.reserve (numberOfBuffers * bufferSize);
+    
+    plugin->prepareToPlay (sampleRate, bufferSize);
+    
+    MidiBuffer renderMidiBuffer;
+    MidiBuffer::Iterator it(midiBuffer);
+    
+    MidiMessage m;
+    int sampleNumber = -1;
+    bool isMessageBetween;
+    bool bufferRemaining = it.getNextEvent(m, sampleNumber);
+    
+    for (int i = 0; i < numberOfBuffers; ++i)
+    {
+        double start = i * bufferSize;
+        double end = (i + 1) * bufferSize;
+        
+        isMessageBetween = sampleNumber >= start && sampleNumber < end;
+        do {
+            if (isMessageBetween) {
+                renderMidiBuffer.addEvent(m, sampleNumber - start);
+                bufferRemaining = it.getNextEvent(m, sampleNumber);
+                isMessageBetween = sampleNumber >= start && sampleNumber < end;
+            }
+        } while (isMessageBetween && bufferRemaining);
+        
+        // Turn Midi to audio via the vst.
+        plugin->processBlock (audioBuffer, renderMidiBuffer);
+        
+        // Get audio features and fill the datastructure.
+        fillAudioFeatures (audioBuffer);
+    }
+}
+
 //==============================================================================
 void RenderEngine::renderPatch (const uint8  midiNote,
                                 const uint8  midiVelocity,
                                 const double noteLength,
-                                const double renderLength,
-                                const bool overridePatch)
+                                const double renderLength)
 {
-    // Get the overriden patch and set the vst parameters with it.
-    if (overridePatch)
-    {
-        PluginPatch overridenPatch = getPatch();
-        for (const auto& parameter : overridenPatch)
-            plugin->setParameter (parameter.first, parameter.second);
-    }
-
     // Get the note on midiBuffer.
     MidiMessage onMessage = MidiMessage::noteOn (1,
                                                  midiNote,
                                                  midiVelocity);
+    
+    MidiMessage offMessage = MidiMessage::noteOff (1,
+                                                 midiNote,
+                                                 midiVelocity);
+    
     onMessage.setTimeStamp(0);
-    MidiBuffer midiNoteBuffer;
-    midiNoteBuffer.addEvent (onMessage, onMessage.getTimeStamp());
-
-    // Setup fft here so it is destroyed when rendering is finished and
-    // the stack unwinds so it doesn't share frames with a new patch.
-    maxiFFT fft;
-    fft.setup (fftSize, fftSize / 2, fftSize / 4);
-
-    // Data structure to hold multi-channel audio data.
-    AudioSampleBuffer audioBuffer (plugin->getTotalNumOutputChannels(),
-                                   bufferSize);
-
-    int numberOfBuffers = int (std::ceil (renderLength * sampleRate / bufferSize));
-
-    // Clear and reserve memory for the audio storage!
-    processedMonoAudioPreview.clear();
-    processedMonoAudioPreview.reserve (numberOfBuffers * bufferSize);
-
-    // Number of FFT, MFCC and RMS frames.
-    int numberOfFFT = int (std::ceil (renderLength * sampleRate / fftSize)) * 4;
-    rmsFrames.clear();
-    rmsFrames.reserve (numberOfFFT);
-    currentRmsFrame = 0.0;
-    mfccFeatures.clear();
-    mfccFeatures.reserve (numberOfFFT);
-
-    plugin->prepareToPlay (sampleRate, bufferSize);
-
-    for (int i = 0; i < numberOfBuffers; ++i)
-    {
-        // Trigger note off if in the correct audio buffer.
-        ifTimeSetNoteOff (noteLength,
-                          sampleRate,
-                          bufferSize,
-                          1,
-                          midiNote,
-                          midiVelocity,
-                          i,
-                          midiNoteBuffer);
-
-        // Turn Midi to audio via the vst.
-        plugin->processBlock (audioBuffer, midiNoteBuffer);
-
-        // Get audio features and fill the datastructure.
-        fillAudioFeatures (audioBuffer, fft);
-    }
+    offMessage.setTimeStamp(noteLength * sampleRate);
+    midiBuffer.addEvent (onMessage, onMessage.getTimeStamp());
+    midiBuffer.addEvent (offMessage, offMessage.getTimeStamp());
+    renderMidi(renderLength);
 }
 
 //=============================================================================
-void RenderEngine::fillAudioFeatures (const AudioSampleBuffer& data,
-                                      maxiFFT&                 fft)
+void RenderEngine::fillAudioFeatures (const AudioSampleBuffer& data)
 {
     // Keep it auto as it may or may not be double precision.
     const auto readptrs = data.getArrayOfReadPointers();
@@ -158,31 +174,6 @@ void RenderEngine::fillAudioFeatures (const AudioSampleBuffer& data,
 
         // Save the audio for playback and plotting!
         processedMonoAudioPreview.push_back (currentFrame);
-
-        // RMS.
-        currentRmsFrame += (currentFrame * currentFrame);
-
-        // Extract features.
-        if (fft.process (currentFrame))
-        {
-            // This isn't real-time so I can take the luxuary of allocating
-            // heap memory here.
-            double* mfccs = new double[13];
-            mfcc.mfcc (fft.magnitudes, mfccs);
-
-            std::array<double, 13> mfccsFrame;
-            std::memcpy (mfccsFrame.data(), mfccs, sizeof (double) * 13);
-
-            // Add the mfcc frames here.
-            mfccFeatures.push_back (mfccsFrame);
-            delete[] mfccs;
-
-            // Root Mean Square.
-            currentRmsFrame /= fftSize;
-            currentRmsFrame = sqrt (currentRmsFrame);
-            rmsFrames.push_back (currentRmsFrame);
-            currentRmsFrame = 0.0;
-        }
     }
 }
 
@@ -419,30 +410,6 @@ const PluginPatch RenderEngine::getPatch()
 const size_t RenderEngine::getPluginParameterSize()
 {
     return pluginParameters.size();
-}
-
-//==============================================================================
-const MFCCFeatures RenderEngine::getMFCCFrames()
-{
-    return mfccFeatures;
-}
-
-//==============================================================================
-const MFCCFeatures RenderEngine::getNormalisedMFCCFrames(const std::array<double, 13>& mean,
-                                                         const std::array<double, 13>& variance)
-{
-    MFCCFeatures normalisedMFCCFrames;
-    normalisedMFCCFrames.resize (mfccFeatures.size());
-
-    for (size_t i = 0; i < normalisedMFCCFrames.size(); ++i)
-    {
-        for (size_t j = 0; j < 13; ++j)
-        {
-            normalisedMFCCFrames[i][j] = mfccFeatures[i][j] - mean[j];
-            normalisedMFCCFrames[i][j] /= variance[j];
-        }
-    }
-    return normalisedMFCCFrames;
 }
 
 //==============================================================================

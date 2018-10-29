@@ -72,20 +72,6 @@ namespace wrap
     }
 
     //==========================================================================
-    // std::vector <std::array <double, 13>> MFCCFeatures;
-    boost::python::list mfccFramesToListOfLists (MFCCFeatures frames)
-    {
-        boost::python::list list;
-        std::vector <std::array <double, 13>>::iterator iter;
-        for (iter = frames.begin(); iter != frames.end(); ++iter)
-        {
-            auto l = arrayToList (*iter);
-    		list.append(l);
-    	}
-    	return list;
-    }
-
-    //==========================================================================
     PluginPatch listOfTuplesToPluginPatch (boost::python::list listOfTuples)
     {
         PluginPatch patch;
@@ -108,8 +94,8 @@ namespace wrap
     class RenderEngineWrapper : public RenderEngine
     {
     public:
-        RenderEngineWrapper (int sr, int bs, int ffts) :
-            RenderEngine (sr, bs, ffts)
+        RenderEngineWrapper (int sr, int bs) :
+            RenderEngine (sr, bs)
         { }
 
         void wrapperSetPatch (boost::python::list listOfTuples)
@@ -132,12 +118,16 @@ namespace wrap
         {
             return pluginPatchToListOfTuples (RenderEngine::getPatch());
         }
+        
+        void wrapperRenderMidi (double renderLength)
+        {
+            RenderEngine::renderMidi(renderLength);
+        }
 
         void wrapperRenderPatch (int    midiNote,
                                  int    midiVelocity,
                                  double noteLength,
-                                 double renderLength,
-                                 bool overridePatch = true)
+                                 double renderLength)
         {
             if (midiNote > 255) midiNote = 255;
             if (midiNote < 0) midiNote = 0;
@@ -146,13 +136,7 @@ namespace wrap
             RenderEngine::renderPatch(midiNote,
                                       midiVelocity,
                                       noteLength,
-                                      renderLength,
-                                      overridePatch);
-        }
-
-        boost::python::list wrapperGetMFCCFrames()
-        {
-            return mfccFramesToListOfLists (RenderEngine::getMFCCFrames());
+                                      renderLength);
         }
 
         int wrapperGetPluginParameterSize()
@@ -175,25 +159,6 @@ namespace wrap
             return vectorToList (RenderEngine::getRMSFrames());
         }
     };
-
-    //==========================================================================
-    class PatchGeneratorWrapper : public PatchGenerator
-    {
-    public:
-        PatchGeneratorWrapper (RenderEngine& engine) :
-            PatchGenerator (engine)
-        { }
-
-        boost::python::tuple wrapperGetRandomParameter (int index)
-        {
-            return parameterToTuple (PatchGenerator::getRandomParameter (index));
-        }
-
-        boost::python::list wrapperGetRandomPatch()
-        {
-            return pluginPatchToListOfTuples (PatchGenerator::getRandomPatch());
-        }
-    };
 }
 
 //==============================================================================
@@ -202,15 +167,18 @@ BOOST_PYTHON_MODULE(librenderman)
     using namespace boost::python;
     using namespace wrap;
 
-    class_<RenderEngineWrapper>("RenderEngine", init<int, int, int>())
+    class_<RenderEngineWrapper>("RenderEngine", init<int, int>())
+    .def("hello", &RenderEngineWrapper::hello)
+    .def("n_midi_events", &RenderEngineWrapper::nMidiEvents)
     .def("load_preset", &RenderEngineWrapper::loadPreset)
     .def("load_plugin", &RenderEngineWrapper::loadPlugin)
+    .def("load_midi", &RenderEngineWrapper::loadMidi)
     .def("get_patch", &RenderEngineWrapper::wrapperGetPatch)
     .def("set_patch", &RenderEngineWrapper::wrapperSetPatch)
     .def("get_parameter", &RenderEngineWrapper::wrapperGetParameter)
     .def("set_parameter", &RenderEngineWrapper::wrapperSetParameter)
+    .def("render_midi", &RenderEngineWrapper::wrapperRenderMidi)
     .def("render_patch", &RenderEngineWrapper::wrapperRenderPatch)
-    .def("get_mfcc_frames", &RenderEngineWrapper::wrapperGetMFCCFrames)
     .def("get_plugin_parameter_size", &RenderEngineWrapper::wrapperGetPluginParameterSize)
     .def("get_plugin_parameters_description", &RenderEngineWrapper::wrapperGetPluginParametersDescription)
     .def("override_plugin_parameter", &RenderEngineWrapper::overridePluginParameter)
@@ -218,8 +186,4 @@ BOOST_PYTHON_MODULE(librenderman)
     .def("get_audio_frames", &RenderEngineWrapper::wrapperGetAudioFrames)
     .def("get_rms_frames", &RenderEngineWrapper::wrapperGetRMSFrames)
     .def("write_to_wav", &RenderEngineWrapper::writeToWav);
-
-    class_<PatchGeneratorWrapper>("PatchGenerator", init<RenderEngineWrapper&>())
-    .def("get_random_parameter", &PatchGeneratorWrapper::wrapperGetRandomParameter)
-    .def("get_random_patch", &PatchGeneratorWrapper::wrapperGetRandomPatch);
 }
